@@ -8,6 +8,9 @@
 (define-constant err-bill-already-paid (err u106))
 (define-constant err-bill-expired (err u107))
 (define-constant err-invalid-provider (err u108))
+(define-constant err-invalid-participant (err u109))
+(define-constant err-total-share-invalid (err u110))
+(define-constant err-already-paid-share (err u111))
 
 (define-data-var next-bill-id uint u1)
 (define-data-var next-provider-id uint u1)
@@ -70,6 +73,21 @@
     }
 )
 
+(define-map bill-participants
+    uint
+    (list 10 {
+        participant: principal,
+        share: uint,
+        paid: bool,
+        payment-id: (optional uint)
+    })
+)
+
+(define-map participant-bills
+    principal
+    (list 100 uint)
+)
+
 (define-data-var next-payment-id uint u1)
 
 (define-read-only (get-contract-owner)
@@ -113,6 +131,14 @@
 
 (define-read-only (get-payment-history (payment-id uint))
     (map-get? payment-history payment-id)
+)
+
+(define-read-only (get-bill-participants (bill-id uint))
+    (default-to (list) (map-get? bill-participants bill-id))
+)
+
+(define-read-only (get-participant-bills (participant principal))
+    (default-to (list) (map-get? participant-bills participant))
 )
 
 (define-read-only (calculate-payment-fee (amount uint))
@@ -307,6 +333,125 @@
             })
             (var-set next-payment-id (+ payment-id u1))
             (ok payment-id)
+        )
+    )
+)
+
+(define-public (create-split-bill
+        (co-payer principal)
+        (amount uint)
+        (due-date uint)
+        (description (string-ascii 100))
+    )
+    (let (
+            (bill-id (var-get next-bill-id))
+            (provider-id-opt (map-get? provider-by-address tx-sender))
+        )
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (> due-date stacks-block-height) err-invalid-amount)
+        
+        (let (
+                (provider-id (unwrap! provider-id-opt err-unauthorized))
+                (provider-data (unwrap! (map-get? providers provider-id) err-not-found))
+                (split-participants (list 
+                    { participant: tx-sender, share: u5000, paid: false, payment-id: none }
+                    { participant: co-payer, share: u5000, paid: false, payment-id: none }
+                ))
+            )
+            (asserts! (get active provider-data) err-unauthorized)
+            
+            (map-set bills bill-id {
+                customer: tx-sender,
+                provider-id: provider-id,
+                amount: amount,
+                due-date: due-date,
+                description: description,
+                paid: false,
+                paid-at: none,
+                created-at: stacks-block-height,
+            })
+            
+            (map-set bill-participants bill-id split-participants)
+            
+            (map-set provider-bills provider-id
+                (unwrap!
+                    (as-max-len?
+                        (append (get-provider-bills provider-id) bill-id)
+                        u200
+                    )
+                    err-invalid-amount
+                ))
+            
+            (map-set participant-bills tx-sender
+                (unwrap!
+                    (as-max-len?
+                        (append (get-participant-bills tx-sender) bill-id)
+                        u100
+                    )
+                    err-invalid-amount
+                ))
+            
+            (map-set participant-bills co-payer
+                (unwrap!
+                    (as-max-len?
+                        (append (get-participant-bills co-payer) bill-id)
+                        u100
+                    )
+                    err-invalid-amount
+                ))
+            
+            (var-set next-bill-id (+ bill-id u1))
+            (ok bill-id)
+        )
+    )
+)
+
+(define-public (pay-split-share (bill-id uint))
+    (let (
+            (bill-data (unwrap! (map-get? bills bill-id) err-not-found))
+            (participants-list (get-bill-participants bill-id))
+            (customer-balance (get-customer-balance tx-sender))
+        )
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (not (get paid bill-data)) err-bill-already-paid)
+        (asserts! (<= stacks-block-height (get due-date bill-data)) err-bill-expired)
+        
+        (if (is-eq (len participants-list) u0)
+            (pay-bill bill-id)
+            (let (
+                    (share-amount (/ (get amount bill-data) u2))
+                    (payment-fee (calculate-payment-fee share-amount))
+                    (total-cost (+ share-amount payment-fee))
+                    (payment-id (var-get next-payment-id))
+                    (provider-data 
+                        (unwrap! 
+                            (map-get? providers (get provider-id bill-data))
+                            err-invalid-provider
+                        ))
+                )
+                (asserts! (>= customer-balance total-cost) err-insufficient-funds)
+                
+                (map-set customer-balances tx-sender (- customer-balance total-cost))
+                (try! (as-contract (stx-transfer? share-amount tx-sender
+                    (get address provider-data)
+                )))
+                (if (> payment-fee u0)
+                    (try! (as-contract (stx-transfer? payment-fee tx-sender contract-owner)))
+                    true
+                )
+                
+                (map-set payment-history payment-id {
+                    bill-id: bill-id,
+                    customer: tx-sender,
+                    amount: share-amount,
+                    fee: payment-fee,
+                    timestamp: stacks-block-height,
+                })
+                (var-set next-payment-id (+ payment-id u1))
+                
+                (ok payment-id)
+            )
         )
     )
 )
