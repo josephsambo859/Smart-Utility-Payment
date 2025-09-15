@@ -75,13 +75,15 @@
 
 (define-map bill-participants
     uint
-    (list 10
+    (list
+        10
         {
-        participant: principal,
-        share: uint,
-        paid: bool,
-        payment-id: (optional uint),
-    })
+            participant: principal,
+            share: uint,
+            paid: bool,
+            payment-id: (optional uint),
+        }
+    )
 )
 
 (define-map participant-bills
