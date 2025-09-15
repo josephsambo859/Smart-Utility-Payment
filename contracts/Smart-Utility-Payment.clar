@@ -75,11 +75,12 @@
 
 (define-map bill-participants
     uint
-    (list 10 {
+    (list 10
+        {
         participant: principal,
         share: uint,
         paid: bool,
-        payment-id: (optional uint)
+        payment-id: (optional uint),
     })
 )
 
@@ -350,17 +351,27 @@
         (asserts! (not (var-get contract-paused)) err-unauthorized)
         (asserts! (> amount u0) err-invalid-amount)
         (asserts! (> due-date stacks-block-height) err-invalid-amount)
-        
+
         (let (
                 (provider-id (unwrap! provider-id-opt err-unauthorized))
                 (provider-data (unwrap! (map-get? providers provider-id) err-not-found))
-                (split-participants (list 
-                    { participant: tx-sender, share: u5000, paid: false, payment-id: none }
-                    { participant: co-payer, share: u5000, paid: false, payment-id: none }
+                (split-participants (list
+                    {
+                        participant: tx-sender,
+                        share: u5000,
+                        paid: false,
+                        payment-id: none,
+                    }
+                    {
+                        participant: co-payer,
+                        share: u5000,
+                        paid: false,
+                        payment-id: none,
+                    }
                 ))
             )
             (asserts! (get active provider-data) err-unauthorized)
-            
+
             (map-set bills bill-id {
                 customer: tx-sender,
                 provider-id: provider-id,
@@ -371,9 +382,9 @@
                 paid-at: none,
                 created-at: stacks-block-height,
             })
-            
+
             (map-set bill-participants bill-id split-participants)
-            
+
             (map-set provider-bills provider-id
                 (unwrap!
                     (as-max-len?
@@ -382,7 +393,7 @@
                     )
                     err-invalid-amount
                 ))
-            
+
             (map-set participant-bills tx-sender
                 (unwrap!
                     (as-max-len?
@@ -391,7 +402,7 @@
                     )
                     err-invalid-amount
                 ))
-            
+
             (map-set participant-bills co-payer
                 (unwrap!
                     (as-max-len?
@@ -400,7 +411,7 @@
                     )
                     err-invalid-amount
                 ))
-            
+
             (var-set next-bill-id (+ bill-id u1))
             (ok bill-id)
         )
@@ -415,8 +426,10 @@
         )
         (asserts! (not (var-get contract-paused)) err-unauthorized)
         (asserts! (not (get paid bill-data)) err-bill-already-paid)
-        (asserts! (<= stacks-block-height (get due-date bill-data)) err-bill-expired)
-        
+        (asserts! (<= stacks-block-height (get due-date bill-data))
+            err-bill-expired
+        )
+
         (if (is-eq (len participants-list) u0)
             (pay-bill bill-id)
             (let (
@@ -424,23 +437,21 @@
                     (payment-fee (calculate-payment-fee share-amount))
                     (total-cost (+ share-amount payment-fee))
                     (payment-id (var-get next-payment-id))
-                    (provider-data 
-                        (unwrap! 
-                            (map-get? providers (get provider-id bill-data))
-                            err-invalid-provider
-                        ))
+                    (provider-data (unwrap! (map-get? providers (get provider-id bill-data))
+                        err-invalid-provider
+                    ))
                 )
                 (asserts! (>= customer-balance total-cost) err-insufficient-funds)
-                
-                (map-set customer-balances tx-sender (- customer-balance total-cost))
-                (try! (as-contract (stx-transfer? share-amount tx-sender
-                    (get address provider-data)
-                )))
+
+                (map-set customer-balances tx-sender
+                    (- customer-balance total-cost)
+                )
+                (try! (as-contract (stx-transfer? share-amount tx-sender (get address provider-data))))
                 (if (> payment-fee u0)
                     (try! (as-contract (stx-transfer? payment-fee tx-sender contract-owner)))
                     true
                 )
-                
+
                 (map-set payment-history payment-id {
                     bill-id: bill-id,
                     customer: tx-sender,
@@ -449,7 +460,7 @@
                     timestamp: stacks-block-height,
                 })
                 (var-set next-payment-id (+ payment-id u1))
-                
+
                 (ok payment-id)
             )
         )
