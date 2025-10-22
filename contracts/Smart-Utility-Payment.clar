@@ -476,3 +476,251 @@
         (ok true)
     )
 )
+
+;; ========================================
+;; Bill Scheduling & Auto-Payment Feature
+;; Clarity v3 - Independent functionality
+;; ========================================
+
+;; New error constants for scheduling (continuing from existing u111)
+(define-constant err-invalid-interval (err u112))
+(define-constant err-invalid-start (err u113))
+(define-constant err-not-due (err u114))
+(define-constant err-inactive (err u115))
+(define-constant err-insufficient-escrow (err u116))
+
+;; Storage for scheduling feature
+(define-data-var next-schedule-id uint u1)
+
+(define-map schedules
+    uint
+    {
+        payer: principal,
+        payee: principal,
+        amount: uint,
+        interval: uint,
+        next-height: uint,
+        total-cycles: (optional uint),
+        executed: uint,
+        auto-pay: bool,
+        active: bool
+    }
+)
+
+(define-map autopay-prefs
+    principal
+    bool
+)
+
+(define-map schedule-escrow
+    principal
+    uint
+)
+
+;; Read-only functions for scheduling
+(define-read-only (get-next-schedule-id)
+    (var-get next-schedule-id)
+)
+
+(define-read-only (get-schedule (id uint))
+    (map-get? schedules id)
+)
+
+(define-read-only (get-schedule-escrow (owner principal))
+    (default-to u0 (map-get? schedule-escrow owner))
+)
+
+(define-read-only (get-autopay-pref (owner principal))
+    (default-to false (map-get? autopay-prefs owner))
+)
+
+(define-read-only (is-schedule-due (id uint))
+    (match (map-get? schedules id)
+        sched
+            (and (get active sched) (>= stacks-block-height (get next-height sched)))
+        false
+    )
+)
+
+;; Public functions for scheduling
+(define-public (set-autopay-pref (enabled bool))
+    (begin
+        (map-set autopay-prefs tx-sender enabled)
+        (ok enabled)
+    )
+)
+
+(define-private (update-schedule-after-payment (id uint))
+    (match (map-get? schedules id)
+        curr
+            (let (
+                    (executed (+ u1 (get executed curr)))
+                    (total (get total-cycles curr))
+                    (interval (get interval curr))
+                    (next (+ (get next-height curr) interval))
+                )
+                (if (is-some total)
+                    (let ((totalv (unwrap-panic total)))
+                        (if (>= executed totalv)
+                            (begin
+                                (map-set schedules id (merge curr { executed: executed, active: false }))
+                                true
+                            )
+                            (begin
+                                (map-set schedules id (merge curr { executed: executed, next-height: next }))
+                                true
+                            )
+                        )
+                    )
+                    (begin
+                        (map-set schedules id (merge curr { executed: executed, next-height: next }))
+                        true
+                    )
+                )
+            )
+        false
+    )
+)
+
+(define-public (create-schedule
+        (payee principal)
+        (amount uint)
+        (start-height uint)
+        (interval uint)
+        (total-cycles (optional uint))
+        (auto-pay bool)
+    )
+    (begin
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (> interval u0) err-invalid-interval)
+        (asserts! (>= start-height stacks-block-height) err-invalid-start)
+        (asserts! (not (is-eq payee tx-sender)) err-unauthorized)
+
+        (let ((id (var-get next-schedule-id)))
+            (map-set schedules id {
+                payer: tx-sender,
+                payee: payee,
+                amount: amount,
+                interval: interval,
+                next-height: start-height,
+                total-cycles: total-cycles,
+                executed: u0,
+                auto-pay: auto-pay,
+                active: true
+            })
+            (var-set next-schedule-id (+ id u1))
+            (ok id)
+        )
+    )
+)
+
+(define-public (cancel-schedule (id uint))
+    (match (map-get? schedules id)
+        sched
+            (if (is-eq (get payer sched) tx-sender)
+                (begin
+                    (map-set schedules id (merge sched { active: false }))
+                    (ok true)
+                )
+                err-unauthorized
+            )
+        err-not-found
+    )
+)
+
+(define-public (deposit-to-escrow (amount uint))
+    (begin
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (> amount u0) err-invalid-amount)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (let ((prev (default-to u0 (map-get? schedule-escrow tx-sender))))
+            (map-set schedule-escrow tx-sender (+ prev amount))
+            (ok (+ prev amount))
+        )
+    )
+)
+
+(define-public (withdraw-from-escrow (amount uint))
+    (let (
+            (caller tx-sender)
+            (bal (default-to u0 (map-get? schedule-escrow tx-sender)))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-unauthorized)
+            (asserts! (> amount u0) err-invalid-amount)
+            (asserts! (>= bal amount) err-insufficient-escrow)
+            (map-set schedule-escrow caller (- bal amount))
+            (try! (as-contract (stx-transfer? amount tx-sender caller)))
+            (ok (- bal amount))
+        )
+    )
+)
+
+(define-public (pay-schedule-now (id uint))
+    (if (var-get contract-paused)
+        err-unauthorized
+        (match (map-get? schedules id)
+            sched
+                (if (and
+                        (get active sched)
+                        (is-eq (get payer sched) tx-sender)
+                        (>= stacks-block-height (get next-height sched))
+                    )
+                    (match (stx-transfer? (get amount sched) tx-sender (get payee sched))
+                        success
+                            (let ((updated (update-schedule-after-payment id)))
+                                (ok updated)
+                            )
+                        error (err error)
+                    )
+                    (if (not (get active sched))
+                        err-inactive
+                        (if (not (is-eq (get payer sched) tx-sender))
+                            err-unauthorized
+                            err-not-due
+                        )
+                    )
+                )
+            err-not-found
+        )
+    )
+)
+
+(define-public (run-autopay (id uint))
+    (if (var-get contract-paused)
+        err-unauthorized
+        (match (map-get? schedules id)
+            sched
+                (let (
+                        (payer (get payer sched))
+                        (payee (get payee sched))
+                        (amt (get amount sched))
+                        (due? (and (get active sched) (>= stacks-block-height (get next-height sched))))
+                        (pref (default-to false (map-get? autopay-prefs (get payer sched))))
+                        (bal (default-to u0 (map-get? schedule-escrow (get payer sched))))
+                    )
+                    (if (and due? (get auto-pay sched) pref (>= bal amt))
+                        (begin
+                            (map-set schedule-escrow payer (- bal amt))
+                            (match (as-contract (stx-transfer? amt tx-sender payee))
+                                success
+                                    (let ((updated (update-schedule-after-payment id)))
+                                        (ok updated)
+                                    )
+                                error (err error)
+                            )
+                        )
+                        (if (not due?)
+                            err-not-due
+                            (if (not (and (get auto-pay sched) pref))
+                                err-unauthorized
+                                err-insufficient-escrow
+                            )
+                        )
+                    )
+                )
+            err-not-found
+        )
+    )
+)
