@@ -62,6 +62,6 @@ plan:
         - emulated-contract-publish:
             contract-name: Smart-Utility-Payment
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: "contracts\\Smart-Utility-Payment.clar"
+            path: contracts/Smart-Utility-Payment.clar
             clarity-version: 3
       epoch: "3.1"

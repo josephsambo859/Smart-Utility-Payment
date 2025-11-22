@@ -303,6 +303,10 @@
             err-bill-expired
         )
         (asserts! (>= customer-balance total-cost) err-insufficient-funds)
+        (match (map-get? bill-disputes bill-id)
+            dispute (asserts! (get resolved dispute) err-dispute-active)
+            true
+        )
 
         (let ((provider-data (unwrap! (map-get? providers (get provider-id bill-data))
                 err-invalid-provider
@@ -431,6 +435,10 @@
         (asserts! (<= stacks-block-height (get due-date bill-data))
             err-bill-expired
         )
+        (match (map-get? bill-disputes bill-id)
+            dispute (asserts! (get resolved dispute) err-dispute-active)
+            true
+        )
 
         (if (is-eq (len participants-list) u0)
             (pay-bill bill-id)
@@ -503,7 +511,7 @@
         total-cycles: (optional uint),
         executed: uint,
         auto-pay: bool,
-        active: bool
+        active: bool,
     }
 )
 
@@ -536,8 +544,7 @@
 
 (define-read-only (is-schedule-due (id uint))
     (match (map-get? schedules id)
-        sched
-            (and (get active sched) (>= stacks-block-height (get next-height sched)))
+        sched (and (get active sched) (>= stacks-block-height (get next-height sched)))
         false
     )
 )
@@ -552,32 +559,46 @@
 
 (define-private (update-schedule-after-payment (id uint))
     (match (map-get? schedules id)
-        curr
-            (let (
-                    (executed (+ u1 (get executed curr)))
-                    (total (get total-cycles curr))
-                    (interval (get interval curr))
-                    (next (+ (get next-height curr) interval))
-                )
-                (if (is-some total)
-                    (let ((totalv (unwrap-panic total)))
-                        (if (>= executed totalv)
-                            (begin
-                                (map-set schedules id (merge curr { executed: executed, active: false }))
-                                true
+        curr (let (
+                (executed (+ u1 (get executed curr)))
+                (total (get total-cycles curr))
+                (interval (get interval curr))
+                (next (+ (get next-height curr) interval))
+            )
+            (if (is-some total)
+                (let ((totalv (unwrap-panic total)))
+                    (if (>= executed totalv)
+                        (begin
+                            (map-set schedules id
+                                (merge curr {
+                                    executed: executed,
+                                    active: false,
+                                })
                             )
-                            (begin
-                                (map-set schedules id (merge curr { executed: executed, next-height: next }))
-                                true
+                            true
+                        )
+                        (begin
+                            (map-set schedules id
+                                (merge curr {
+                                    executed: executed,
+                                    next-height: next,
+                                })
                             )
+                            true
                         )
                     )
-                    (begin
-                        (map-set schedules id (merge curr { executed: executed, next-height: next }))
-                        true
+                )
+                (begin
+                    (map-set schedules id
+                        (merge curr {
+                            executed: executed,
+                            next-height: next,
+                        })
                     )
+                    true
                 )
             )
+        )
         false
     )
 )
@@ -607,7 +628,7 @@
                 total-cycles: total-cycles,
                 executed: u0,
                 auto-pay: auto-pay,
-                active: true
+                active: true,
             })
             (var-set next-schedule-id (+ id u1))
             (ok id)
@@ -617,14 +638,13 @@
 
 (define-public (cancel-schedule (id uint))
     (match (map-get? schedules id)
-        sched
-            (if (is-eq (get payer sched) tx-sender)
-                (begin
-                    (map-set schedules id (merge sched { active: false }))
-                    (ok true)
-                )
-                err-unauthorized
+        sched (if (is-eq (get payer sched) tx-sender)
+            (begin
+                (map-set schedules id (merge sched { active: false }))
+                (ok true)
             )
+            err-unauthorized
+        )
         err-not-found
     )
 )
@@ -661,27 +681,25 @@
     (if (var-get contract-paused)
         err-unauthorized
         (match (map-get? schedules id)
-            sched
-                (if (and
-                        (get active sched)
-                        (is-eq (get payer sched) tx-sender)
-                        (>= stacks-block-height (get next-height sched))
+            sched (if (and
+                    (get active sched)
+                    (is-eq (get payer sched) tx-sender)
+                    (>= stacks-block-height (get next-height sched))
+                )
+                (match (stx-transfer? (get amount sched) tx-sender (get payee sched))
+                    success (let ((updated (update-schedule-after-payment id)))
+                        (ok updated)
                     )
-                    (match (stx-transfer? (get amount sched) tx-sender (get payee sched))
-                        success
-                            (let ((updated (update-schedule-after-payment id)))
-                                (ok updated)
-                            )
-                        error (err error)
-                    )
-                    (if (not (get active sched))
-                        err-inactive
-                        (if (not (is-eq (get payer sched) tx-sender))
-                            err-unauthorized
-                            err-not-due
-                        )
+                    error (err error)
+                )
+                (if (not (get active sched))
+                    err-inactive
+                    (if (not (is-eq (get payer sched) tx-sender))
+                        err-unauthorized
+                        err-not-due
                     )
                 )
+            )
             err-not-found
         )
     )
@@ -691,36 +709,130 @@
     (if (var-get contract-paused)
         err-unauthorized
         (match (map-get? schedules id)
-            sched
-                (let (
-                        (payer (get payer sched))
-                        (payee (get payee sched))
-                        (amt (get amount sched))
-                        (due? (and (get active sched) (>= stacks-block-height (get next-height sched))))
-                        (pref (default-to false (map-get? autopay-prefs (get payer sched))))
-                        (bal (default-to u0 (map-get? schedule-escrow (get payer sched))))
+            sched (let (
+                    (payer (get payer sched))
+                    (payee (get payee sched))
+                    (amt (get amount sched))
+                    (due? (and (get active sched) (>= stacks-block-height (get next-height sched))))
+                    (pref (default-to false (map-get? autopay-prefs (get payer sched))))
+                    (bal (default-to u0 (map-get? schedule-escrow (get payer sched))))
+                )
+                (if (and
+                        due?
+                        (get auto-pay sched)
+                        pref
+                        (>= bal amt)
                     )
-                    (if (and due? (get auto-pay sched) pref (>= bal amt))
-                        (begin
-                            (map-set schedule-escrow payer (- bal amt))
-                            (match (as-contract (stx-transfer? amt tx-sender payee))
-                                success
-                                    (let ((updated (update-schedule-after-payment id)))
-                                        (ok updated)
-                                    )
-                                error (err error)
+                    (begin
+                        (map-set schedule-escrow payer (- bal amt))
+                        (match (as-contract (stx-transfer? amt tx-sender payee))
+                            success (let ((updated (update-schedule-after-payment id)))
+                                (ok updated)
                             )
+                            error (err error)
                         )
-                        (if (not due?)
-                            err-not-due
-                            (if (not (and (get auto-pay sched) pref))
-                                err-unauthorized
-                                err-insufficient-escrow
-                            )
+                    )
+                    (if (not due?)
+                        err-not-due
+                        (if (not (and (get auto-pay sched) pref))
+                            err-unauthorized
+                            err-insufficient-escrow
                         )
                     )
                 )
+            )
             err-not-found
         )
+    )
+)
+
+(define-constant err-already-disputed (err u117))
+(define-constant err-no-dispute (err u118))
+(define-constant err-dispute-active (err u119))
+(define-constant err-dispute-resolved (err u120))
+
+(define-map bill-disputes
+    uint
+    {
+        raised-by: principal,
+        reason: (string-ascii 100),
+        created-at: uint,
+        resolved: bool,
+        resolved-by: (optional principal),
+        resolved-at: (optional uint),
+        resolution-note: (optional (string-ascii 100)),
+    }
+)
+
+(define-read-only (get-bill-dispute (bill-id uint))
+    (map-get? bill-disputes bill-id)
+)
+
+(define-read-only (is-bill-disputed (bill-id uint))
+    (match (map-get? bill-disputes bill-id)
+        dispute (not (get resolved dispute))
+        false
+    )
+)
+
+(define-public (raise-bill-dispute
+        (bill-id uint)
+        (reason (string-ascii 100))
+    )
+    (let (
+            (bill-data (unwrap! (map-get? bills bill-id) err-not-found))
+            (existing (map-get? bill-disputes bill-id))
+        )
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (is-eq tx-sender (get customer bill-data)) err-unauthorized)
+        (asserts! (not (get paid bill-data)) err-bill-already-paid)
+        (asserts! (> (len reason) u0) err-invalid-amount)
+        (match existing
+            dispute (asserts! (get resolved dispute) err-already-disputed)
+            true
+        )
+        (map-set bill-disputes bill-id {
+            raised-by: tx-sender,
+            reason: reason,
+            created-at: stacks-block-height,
+            resolved: false,
+            resolved-by: none,
+            resolved-at: none,
+            resolution-note: none,
+        })
+        (ok true)
+    )
+)
+
+(define-public (resolve-bill-dispute
+        (bill-id uint)
+        (resolution-note (optional (string-ascii 100)))
+    )
+    (let (
+            (dispute (unwrap! (map-get? bill-disputes bill-id) err-no-dispute))
+            (bill-data (unwrap! (map-get? bills bill-id) err-not-found))
+            (provider-data (unwrap! (map-get? providers (get provider-id bill-data))
+                err-invalid-provider
+            ))
+        )
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (not (get resolved dispute)) err-dispute-resolved)
+        (asserts!
+            (or
+                (is-eq tx-sender contract-owner)
+                (is-eq tx-sender (get address provider-data))
+            )
+            err-unauthorized
+        )
+        (map-set bill-disputes bill-id {
+            raised-by: (get raised-by dispute),
+            reason: (get reason dispute),
+            created-at: (get created-at dispute),
+            resolved: true,
+            resolved-by: (some tx-sender),
+            resolved-at: (some stacks-block-height),
+            resolution-note: resolution-note,
+        })
+        (ok true)
     )
 )
